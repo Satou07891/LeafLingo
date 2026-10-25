@@ -1,0 +1,7 @@
+nbtlib
+customtkinter
+Pillow
+openai
+deep-translator
+deepl
+requests
