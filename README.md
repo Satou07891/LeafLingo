@@ -135,7 +135,7 @@ Q：翻译后游戏里还是英文？
 本项目灵感来自 [maptranslate](https://github.com/xmdhs/maptranslate)。
 
 ⚠️ 本工具不保证 100% 覆盖所有文本，过滤规则可能会误筛少量边角内容，但主体展示文本（告示牌、书本、物品、实体名、标题）覆盖率在 97% 以上。如遇明显漏翻，欢迎提交 Issue 并附上TEXT原文
-<img width="1901" height="1024" alt="image" src="https://github.com/user-attachments/assets/8f3cb2e2-848a-40d4-8c48-4f21227a4037" />
+
 <img width="1901" height="1023" alt="屏幕截图 2026-10-26 083053" src="https://github.com/user-attachments/assets/2ef3f27f-987e-4501-80ba-93362ca35aa2" />
 <img width="1125" height="1007" alt="屏幕截图 2026-10-26 091633" src="https://github.com/user-attachments/assets/b25752f2-5204-4323-9bd2-0e4bd898f507" />
 <img width="622" height="783" alt="屏幕截图 2026-10-26 092632" src="https://github.com/user-attachments/assets/d37f18c3-d4f8-4e11-ba04-551de777a15d" />
