@@ -128,9 +128,9 @@ Q：翻译后游戏里还是英文？
 灵感来自 maptranslate，在过滤规则、写回机制、版本兼容性等方面做了大量改进。
 
 🙏 致谢
-nbtlib — NBT 解析
+[nbtlib](https://github.com/vberlier/nbtlib) — NBT 解析
 
-CustomTkinter — UI
+[CustomTkinter](https://github.com/TomSchimansky/CustomTkinter) — UI
 
 本项目灵感来自 [maptranslate](https://github.com/xmdhs/maptranslate)。
 
