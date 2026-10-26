@@ -226,14 +226,15 @@ if getattr(sys, 'frozen', False):
 else:
     # 如果是源码运行，获取当前 py 文件所在目录
     BASE_DIR = Path(__file__).resolve().parent
-DATA_JSON = BASE_DIR / "data.json"
-DATA_ORIG_JSON = BASE_DIR / "data_orig.json"
-LANG_JSON = BASE_DIR / "lang.json"
-DP_DATA_JSON = BASE_DIR / "dp_data.json"
-DP_DATA_ORIG_JSON = BASE_DIR / "dp_data_orig.json"
-DP_LANG_JSON = BASE_DIR / "dp_lang.json"
+WORK_DIR = BASE_DIR / "LeafLingo_work"
+DATA_JSON = WORK_DIR / "data.json"
+DATA_ORIG_JSON = WORK_DIR / "data_orig.json"
+LANG_JSON = WORK_DIR / "lang.json"
+DP_DATA_JSON = WORK_DIR / "dp_data.json"
+DP_DATA_ORIG_JSON = WORK_DIR / "dp_data_orig.json"
+DP_LANG_JSON = WORK_DIR / "dp_lang.json"
 WORLD_BACKUP = BASE_DIR.parent / (BASE_DIR.name + "_backup")
-DP_BACKUP = BASE_DIR / "datapacks_backup"
+DP_BACKUP = WORK_DIR / "datapacks_backup"
 
 UNZIPPED_RECORDS = [] 
 
@@ -244,11 +245,44 @@ UNZIPPED_RECORDS = []
 # 手动翻译：提取 / 回填 辅助函数
 # ==========================================
 
+def _is_base64_blob(s):
+    """判断是否为 Base64 乱码（如皮肤数据）"""
+    if not isinstance(s, str): return False
+    t = s.strip()
+    if t.startswith("eyJ") or t.startswith("ewog"): return True
+    if len(t) > 64 and re.fullmatch(r'[a-zA-Z0-9+/=\n\r]+', t): return True
+    return False
+
+def _is_playsound_text(s):
+    """判断是否纯 /playsound 音效指令，剥掉所有私有区字符再判断。"""
+    if not isinstance(s, str): return False
+    clean = re.sub(r'[\ue000-\uf8ff\u0000-\u001f]', '', s)
+    return clean.strip().lstrip("./: ").lower().startswith("playsound ")
+
+_URL_PREFIX_RE = re.compile(r'^(?:https?://|www\.)', re.I)
+_URL_DOMAIN_RE = re.compile(r'^[A-Za-z0-9.-]+\.(?:com|net|org|io|cn|gg|tv|me|co|app|dev|cc|xyz)$', re.I)
+
+def _is_url_text(s):
+    """判断是否为网址/域名，不应翻译。"""
+    if not isinstance(s, str): return False
+    t = s.strip()
+    if not t: return False
+    if _URL_PREFIX_RE.match(t): return True
+    if _URL_DOMAIN_RE.match(t): return True
+    return False
+
+def _text_fp(s):
+    """文本指纹：SHA256 前 8 位，用于 TXT 导入导出按内容匹配。"""
+    if not isinstance(s, str): return ""
+    return sha256(s.encode("utf-8")).hexdigest()[:8]
+
 def _manual_should_skip(s):
     if not isinstance(s, str): return True
     t = s.strip()
     if t == "": return True
-    if t.startswith("eyJ"): return True     # ← 【新增】跳过头颅皮肤等 Base64 乱码
+    if _is_playsound_text(t): return True
+    if _is_base64_blob(t): return True     # ← 【新增】跳过头颅皮肤等 Base64 乱码
+    if _is_url_text(t): return True
     if t.startswith("minecraft:"): return True
     if re.match(r'^\[\d{2}:\d{2}:\d{2}\]\s*$', t): return True
     if not re.search(r'[a-zA-Z]', t): return True
@@ -370,6 +404,8 @@ def _should_skip_for_display(s):
     if not isinstance(s, str): return True
     t = s.strip()
     if t == "": return True
+    if _is_playsound_text(t): return True
+    if _is_url_text(t): return True
     if t.startswith("minecraft:"): return True
     if re.match(r'^\[\d{2}:\d{2}:\d{2}\]\s*$', t): return True
     if not re.search(r'[a-zA-Z\u4e00-\u9fff]', t): return True
@@ -377,8 +413,15 @@ def _should_skip_for_display(s):
 
 
 def _collect_all_texts(obj):
-    """收集所有可显示的 text（中英文都收），严格按出现顺序排列。"""
+    """收集所有可显示的 text（中英文都收），严格按出现顺序排列。
+    text 值本身是 JSON 时递归解析；无引号 JSON 用正则提取 name:/text:。"""
     results = []
+    seen = set()
+    def add(v):
+        if _should_skip_for_display(v): return
+        if is_namespace_id(v): return
+        if is_translation_key(v): return
+        results.append(v)
     def walk(o):
         if isinstance(o, dict):
             if o.get("type") == "minecraft:player": return
@@ -387,7 +430,22 @@ def _collect_all_texts(obj):
                 if k == "text" and isinstance(v, str):
                     if _should_skip_for_display(v): continue
                     if insertion is not None and v == insertion: continue
-                    results.append(v)
+                    vs = v.strip()
+                    if vs.startswith("{") or vs.startswith("["):
+                        try:
+                            parsed = json.loads(vs)
+                            walk(parsed)
+                            continue
+                        except Exception:
+                            for m in re.finditer(r'\\?"?(?:\bname|\btext|\bCustomName)\\?"?\s*:\s*\\?"([^"\\]+)\\?"', vs):
+                                vv = m.group(1).replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+                                if _should_skip_for_display(vv): continue
+                                if is_namespace_id(vv) or is_translation_key(vv): continue
+                                if INTERNAL_TAG_RE.match(vv): continue
+                                if vv.startswith("generic.") or vv.startswith("minecraft:"): continue
+                                add(vv)
+                            continue
+                    add(v)
                 elif k == "tag" and isinstance(v, str):
                     tag_matches = []
                     for m in re.finditer(r'\\"text\\":\\"((?:[^"\\]|\\.)*?)\\"', v):
@@ -396,7 +454,7 @@ def _collect_all_texts(obj):
                         tag_matches.append((m.start(), m.group(1)))
                     tag_matches.sort(key=lambda x: x[0])
                     for _, val in tag_matches:
-                        if not _should_skip_for_display(val): results.append(val)
+                        if not _should_skip_for_display(val): add(val)
                 else:
                     walk(v)
         elif isinstance(o, list):
@@ -469,7 +527,35 @@ def _replace_all_texts(raw_text, new_lines):
                 if k == "text" and isinstance(v, str):
                     if _should_skip_for_display(v): continue
                     if insertion is not None and v == insertion: continue
-                    
+                    vs = v.strip()
+                    if vs.startswith("{") or vs.startswith("["):
+                        try:
+                            json.loads(vs)
+                            _is_inline_json = False
+                        except Exception:
+                            _is_inline_json = True
+                        if _is_inline_json:
+                            _replaced = [False]
+                            def _repl(m):
+                                val = m.group(1)
+                                if _should_skip_for_display(val): return m.group(0)
+                                if is_namespace_id(val) or is_translation_key(val): return m.group(0)
+                                if INTERNAL_TAG_RE.match(val): return m.group(0)
+                                if val.startswith("generic.") or val.startswith("minecraft:"): return m.group(0)
+                                try:
+                                    zh = next(it)
+                                except StopIteration:
+                                    return m.group(0)
+                                _replaced[0] = True
+                                esc = zh.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+                                prefix = m.group(0)[:m.start(1) - m.start(0)]
+                                suffix = m.group(0)[m.end(1) - m.start(0):]
+                                return prefix + esc + suffix
+                            v2 = re.sub(r'\\?"?(?:\bname|\btext|\bCustomName)\\?"?\s*:\s*\\?"([^"\\]+)\\?"', _repl, v)
+                            if _replaced[0]:
+                                o[k] = v2
+                                last_node_ref[0] = (o, k)
+                                continue
                     try:
                         o[k] = next(it)
                         last_node_ref[0] = (o, k)
@@ -520,9 +606,63 @@ def _replace_all_texts(raw_text, new_lines):
 
     return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
 
+def _unwrap_cmd(raw_text):
+    """如果指令被包在 JSON 组件里，剥离外壳返回真实的指令字符串"""
+    raw_text = raw_text.strip()
+    if raw_text.startswith("{") and raw_text.endswith("}"):
+        try:
+            obj = json.loads(raw_text)
+            if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+                inner = obj["text"]
+                if re.match(r'^/?\s*(?:give|execute|summon|setblock|fill|data|scoreboard|tp|teleport|function|advancement|item|effect|enchant|say|tellraw|title|subtitle|actionbar|me|msg|tell|kill|clear|xp|experience|gamerule|time|weather|spawnpoint|setworldspawn|playsound|particle)\s', inner, re.IGNORECASE):
+                    return inner
+        except Exception:
+            pass
+    return raw_text
+
+def _extract_cmd_texts(cmd_str):
+    """从长指令中提取纯文本，全面兼容 NBT 转义 (\") 和未转义格式"""
+    matches = []
+    
+    # 1. 匹配 text 节点（兼容 "text":"xxx", "text":"xxx", text:"xxx"）
+    for m in re.finditer(r'\\?"?text\\?"?\s*:\s*\\?"((?:[^"\\]|\\.)*?)\\?"', cmd_str):
+        matches.append((m.start(1), m.end(1), m.group(1)))
+
+    # 2. 匹配 item_name="xxx" 或 custom_name="xxx"
+    for m in re.finditer(r'\b(?:item_name|custom_name)\s*=\s*\\?"([^"\\]+?)\\?"', cmd_str):
+        matches.append((m.start(1), m.end(1), m.group(1)))
+        
+    # 3. 匹配 CustomName:"xxx" 或 CustomName="xxx"
+    for m in re.finditer(r'\bCustomName\s*[:=]\s*\\?"((?:[^"\\]|\\.)*?)\\?"', cmd_str):
+        matches.append((m.start(1), m.end(1), m.group(1)))
+    for m in re.finditer(r'(?:(?<=\{)|(?<=,))\s*[Nn]ame\s*:\s*\\?"((?:[^"\\]|\\.)*?)\\?"', cmd_str):
+        matches.append((m.start(1), m.end(1), m.group(1)))
+
+    # 去重并按位置排序
+    matches.sort(key=lambda x: x[0])
+    unique_matches = []
+    last_end = -1
+    for start, end, val in matches:
+        if start >= last_end:
+            unique_matches.append((start, end, val))
+            last_end = end
+    return unique_matches
+
 def extract_display_text(raw_text):
     raw_text = raw_text.strip()
-    
+
+    # 【过滤】纯文本 /playsound 是音效指令，没有可翻文本
+    if _is_playsound_text(raw_text):
+        return ""
+    # 【过滤】纯文本 URL / 域名
+    if _is_url_text(raw_text):
+        return ""
+
+    # 检查是否是包装的指令
+    unwrapped = _unwrap_cmd(raw_text)
+    if unwrapped != raw_text:
+        raw_text = unwrapped
+
     # 无论是英文还是中文，只要是 JSON，统统按行拆开展示
     if raw_text.startswith("{") or raw_text.startswith("["):
         try:
@@ -531,7 +671,60 @@ def extract_display_text(raw_text):
             if texts:
                 return "\n".join(texts) # 中英文混排，按行输出
         except Exception:
+            # 1.8 版本的无引号 JSON 会导致 json.loads 报错，不要直接放弃，继续往下走提取指令
             pass
+
+    # 【无引号 JSON 兜底】json.loads 失败后，直接找 name:"..." / text:"..." / CustomName:"..."
+    if raw_text.startswith("{") or raw_text.startswith("["):
+        loose = re.findall(r'\\?"?(?:\bname|\btext|\bCustomName)\\?"?\s*:\s*\\?"([^"\\]+)\\?"', raw_text)
+        valid = []
+        for v in loose:
+            vv = v.replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+            if not vv.strip() or _is_base64_blob(vv): continue
+            if is_namespace_id(vv) or is_translation_key(vv): continue
+            if INTERNAL_TAG_RE.match(vv): continue
+            if vv.startswith("generic.") or vv.startswith("minecraft:"): continue
+            if not re.search(r'[a-zA-Z\u4e00-\u9fff]', vv): continue
+            valid.append(vv)
+        if valid:
+            return "\n".join(valid)
+        # loose 非空但 valid 为空：说明里面只有翻译键/命名空间/内部名，整条不显示
+        if loose:
+            return ""
+
+    # 【1.8 修复】tellraw / title / subtitle / actionbar 开头的无引号 JSON，
+    # 直接用宽松正则兜底，不依赖 _extract_cmd_texts 的复杂正则
+    if re.match(r'^/?\s*(?:tellraw|title|subtitle|actionbar)\s', raw_text, re.IGNORECASE):
+        loose = re.findall(r'text\s*:\s*"([^"]*)"', raw_text)
+        if loose:
+            valid = [v for v in loose if v.strip() and not _is_base64_blob(v)]
+            if valid:
+                return "\n".join(valid)
+
+    # 处理指令（如 give / tellraw），只提取里面的文本，不展示整段
+    cmd_matches = _extract_cmd_texts(raw_text)
+    if cmd_matches:
+        # 不过滤中文，只要不是空的、且不是 Base64 就显示
+        valid_texts = []
+        for _, _, val in cmd_matches:
+            # 反转义提取出来的文本
+            v = val.replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+            if not v.strip() or _is_base64_blob(v): continue
+            if is_namespace_id(v) or is_translation_key(v): continue
+            if INTERNAL_TAG_RE.match(v): continue
+            if v.startswith("generic.") or v.startswith("minecraft:"): continue
+            valid_texts.append(v)
+        if valid_texts:
+            return "\n".join(valid_texts)
+        return ""
+
+    _emb = re.search(r'(?<![.\w])(?:say|tell|msg|tm)\s+(.+)$', raw_text, re.I)
+    if _emb:
+        _t = _emb.group(1).strip()
+        if _t.startswith('"') and _t.endswith('"'):
+            _t = _t[1:-1]
+        if _t and not _is_base64_blob(_t):
+            return _t
             
     # 纯文本情况
     items = extract_translatable(raw_text)
@@ -550,9 +743,49 @@ def replace_display_text(raw_text, new_text):
     if ns.startswith("{") or ns.startswith("["):
         return new_text
         
+    # 检查是否是包装的指令
+    unwrapped = _unwrap_cmd(raw_text)
+    if unwrapped != raw_text:
+        inner_replaced = replace_display_text(unwrapped, ns)
+        try:
+            obj = json.loads(raw_text.strip())
+            obj["text"] = inner_replaced
+            return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+        except Exception:
+            return raw_text
+
     # 原文是纯文本，直接覆盖，但必须保留首尾空白（如 " \nObjective Item" 的 " \n"）
     if not (raw_text.strip().startswith("{") or raw_text.strip().startswith("[")):
         if not ns: return raw_text  # 用户全删了，保留原样
+
+        # 处理指令（如 give / tellraw），按顺序将译文塞回原指令
+        cmd_matches = _extract_cmd_texts(raw_text)
+        if cmd_matches:
+            # 解除过滤，确保内容能被塞回
+            valid_matches = []
+            for start, end, val in cmd_matches:
+                v = val.replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+                if not v.strip() or _is_base64_blob(v): continue
+                if is_namespace_id(v) or is_translation_key(v): continue
+                if INTERNAL_TAG_RE.match(v): continue
+                if v.startswith("generic.") or v.startswith("minecraft:"): continue
+                valid_matches.append((start, end, val))
+            lines = ns.split("\n")
+            result = raw_text
+            # 【修复】倒序替换，避免前一个替换改变长度后，后一个 start/end 错位
+            for i in range(len(valid_matches) - 1, -1, -1):
+                start, end, old_val = valid_matches[i]
+                if i < len(lines):
+                    new_val = lines[i]
+                    escaped = new_val.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+                    result = result[:start] + escaped + result[end:]
+            return result
+
+        _emb = re.search(r'(?<![.\w])(?:say|tell|msg|tm)\s+(.+)$', raw_text, re.I)
+        if _emb:
+            start, end = _emb.start(1), _emb.end(1)
+            escaped = ns.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+            return raw_text[:start] + escaped + raw_text[end:]
         
         # 提取原文的首尾空白
         leading_ws = re.match(r'^\s*', raw_text).group(0) if raw_text else ""
@@ -572,14 +805,35 @@ def replace_display_text(raw_text, new_text):
     # 原文是 JSON，不管玩家填了几行，都按顺序安全回填
     try:
         obj = json.loads(raw_text)
-        existing = _collect_all_texts(obj)
-        if not existing:
-            return new_text
-            
-        lines = ns.split("\n")
-        return _replace_all_texts(raw_text, lines)
     except Exception:
+        # 【修复】无引号 JSON：json.loads 失败时，走 _extract_cmd_texts 按位置替换，
+        # 保留 name:/text:/CustomName 周围的 color/clickEvent 等结构。
+        cmd_matches = _extract_cmd_texts(raw_text)
+        if cmd_matches:
+            valid_matches = []
+            for start, end, val in cmd_matches:
+                v = val.replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+                if not v.strip() or _is_base64_blob(v): continue
+                if is_namespace_id(v) or is_translation_key(v): continue
+                if INTERNAL_TAG_RE.match(v): continue
+                if v.startswith("generic.") or v.startswith("minecraft:"): continue
+                valid_matches.append((start, end, val))
+            lines = ns.split("\n")
+            result = raw_text
+            for i in range(len(valid_matches) - 1, -1, -1):
+                start, end, old_val = valid_matches[i]
+                if i < len(lines):
+                    new_val = lines[i]
+                    escaped = new_val.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+                    result = result[:start] + escaped + result[end:]
+            return result
         return new_text
+
+    existing = _collect_all_texts(obj)
+    if not existing:
+        return new_text
+    lines = ns.split("\n")
+    return _replace_all_texts(raw_text, lines)
 
 def extract_for_check(raw_text):
     """查漏专用：整段含中文视为已翻译（不报）；纯英文时，
@@ -711,14 +965,15 @@ UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA
 INTERNAL_TAG_RE = re.compile(r"^[a-z][a-z0-9_]{2,30}$")
 
 COMMAND_KEYWORDS = (
-    "execute ", "scoreboard ", "setblock ", "summon ", "function ", "give ", "clear ", "kill ", "tp ", "teleport ", "effect ",
+    "entitydata ", "blockdata ", "stats ", "data modify ", "data remove ",
+    "testfor ", "testforblock ", "execute ", "scoreboard ", "setblock ", "summon ", "function ", "give ", "clear ", "kill ", "tp ", "teleport ", "effect ",
     "particle ", "playsound ", "tag ", "team ", "data merge", "data get", "fill ", "clone ", "advancement ", "gamemode ", "gamerule ",
     "difficulty ", "time ", "weather ", "forceload", "locate ", "loot ", "place ", "recipe ", "reload ", "replaceitem", "schedule ",
     "seed", "setidletimeout", "setworldspawn", "spawnpoint", "spreadplayers", "stopsound", "trigger ", "worldborder ",
     "waypoint ", "ride ", "attribute ", "bossbar ", "damage ", "enchant ", "experience ", "xp ", "op ", "deop ", "random "
 )
 OUTPUT_COMMANDS = ("say ", "tell ", "msg ", "tellraw ", "title ", "subtitle ", "actionbar ", "me ", "broadcast ", "teammsg ", "tm ")
-HAS_TEXT_COMPONENT_RE = re.compile(r'\b(?:minecraft:)?(?:text|translate|custom_name|item_name|lore|display_name)\s*[:=]')
+HAS_TEXT_COMPONENT_RE = re.compile(r'\b(?:minecraft:)?(?:text|translate|custom_name|item_name|lore|display_name|CustomName)\s*[:=]|\bName\s*:\s*(?:"|\\")')
 OUTPUT_INLINE_RE = re.compile(r"\b(say|tell|msg|tellraw|title|subtitle|actionbar|me|broadcast|teammsg|tm)\s", re.IGNORECASE)
 MC_RESERVED_WORDS = {
     "black", "dark_blue", "dark_green", "dark_aqua", "dark_red", "dark_purple", "gold", "gray", "dark_gray", "blue", "green", "aqua", "red",
@@ -751,18 +1006,65 @@ def is_logic_command(s):
     return False
 def contains_text_component(s): return bool(HAS_TEXT_COMPONENT_RE.search(s) or OUTPUT_INLINE_RE.search(s))
 
+def _has_translatable_cmd_text(s):
+    """判断指令里是否有真正可翻的文本。过滤内部名、命名空间、NBT 属性名。"""
+    for _, _, v in _extract_cmd_texts(s):
+        vv = v.replace('\\"', '"').replace("\\\\", "\\")
+        if not vv.strip(): continue
+        if _is_base64_blob(vv): continue
+        if is_namespace_id(vv): continue
+        if INTERNAL_TAG_RE.match(vv): continue
+        if vv.startswith("generic.") or vv.startswith("minecraft:"): continue
+        if not has_translatable_text(vv): continue
+        return True
+    _m = re.search(r'(?<![.\w])(?:say|tell|msg|tm)\s+(.+)$', s, re.I)
+    if _m:
+        payload = _m.group(1).strip()
+        if payload.startswith('"') and payload.endswith('"'):
+            payload = payload[1:-1]
+        if payload and not _is_base64_blob(payload) and has_translatable_text(payload):
+            return True
+    return False
+
 def json_component_has_text(s):
     s = s.strip()
     if not (s.startswith("{") and s.endswith("}")): return True
-    try: obj = json.loads(s)
-    except Exception: return True
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return True
+    def _has_text_value(t):
+        if not isinstance(t, str): return False
+        if _is_playsound_text(t):
+            return False
+        ts = t.strip()
+        if ts.startswith("{") or ts.startswith("["):
+            for m in re.finditer(r'\\?"?(?:\bname|\btext|\bCustomName)\\?"?\s*:\s*\\?"([^"\\]+)\\?"', ts):
+                vv = m.group(1).replace('\\"', '"').replace("\\'", "'").replace('\\\\', '\\')
+                if not has_translatable_text(vv): continue
+                if is_namespace_id(vv) or is_translation_key(vv): continue
+                if INTERNAL_TAG_RE.match(vv): continue
+                if vv.startswith("generic.") or vv.startswith("minecraft:"): continue
+                return True
+            return False
+        if not has_translatable_text(ts): return False
+        if _is_url_text(ts): return False
+        if is_namespace_id(ts) or is_translation_key(ts): return False
+        return True
     def _has(o):
         if isinstance(o, dict):
-            if isinstance(o.get("text"), str) and has_translatable_text(o["text"]): return True
+            if "text" in o and _has_text_value(o.get("text")): return True
+            if "name" in o and _has_text_value(o.get("name")): return True
             return any(_has(v) for v in o.values())
         elif isinstance(o, list): return any(_has(v) for v in o)
         return False
-    return _has(obj)
+    if _has(obj): return True
+    for m in re.finditer(r'\b(?:text|[Nn]ame)\s*:\s*\\?"([^"\\]*)\\?"', s):
+        v = m.group(1)
+        if not has_translatable_text(v): continue
+        if is_namespace_id(v) or is_translation_key(v): continue
+        return True
+    return False
 
 def last_key(path_str):
     for t in reversed(split_path(path_str)):
@@ -774,27 +1076,81 @@ def last_key(path_str):
 def should_extract_full(path_str, value, raw_mode=False):
     if raw_mode: return True
     key = last_key(path_str)
-    if key in ("Lore", "lore", "__LORE_MERGE__"): return has_translatable_text(value)
-    if key == "text" and ("Lore" in path_str or "lore" in path_str): return has_translatable_text(value)
-    if key in MERGE_KEYS: return has_translatable_text(value)
+    if key in ("Lore", "lore", "__LORE_MERGE__"): return has_translatable_text(value) and not _is_url_text(value)
+    if key == "text" and ("Lore" in path_str or "lore" in path_str): return has_translatable_text(value) and not _is_url_text(value)
+    if key in MERGE_KEYS: return has_translatable_text(value) and not _is_url_text(value)
     if key in BLACKLIST_LEAF: return False
     if key not in TRANSLATABLE_LEAF: return False
+
+    # 【1.8 命令方块 LastOutput 过滤】
+    # "Command set: /testfor ..." 和 "Test passed/failed" 是命令方块状态输出，不是可翻译文本
+    if key in ("LastOutput", "last_output"):
+        s_low = value.strip().lower()
+        if "command set:" in s_low or "test passed" in s_low or "test failed" in s_low:
+            return False
+        if re.match(r'^(?:/?testfor|/?testforblock|/?scoreboard|/?execute|/?setblock|/?summon|/?fill|/?data)\s', value.strip(), re.IGNORECASE):
+            return False
+
     s = value.strip()
     if not s or not has_translatable_text(s) or is_namespace_id(s) or s.lower() in MC_RESERVED_WORDS: return False
+    if _is_url_text(s): return False
+
+    # 【过滤】坐标字符串：x=...,y=...,z=... 或 [x=...,...]
+    if re.match(r'^\[?[xyz]=', s):
+        return False
+
+    # 【过滤】playsound 是纯音效指令，没有可翻译文本。
+    # 去掉开头 ./: 后判断，同时覆盖 /playsound 和 ./playsound 两种写法。
+    _s_clean = re.sub(r'[\ue000-\uf8ff\u0000-\u001f]', '', s)
+    _s_cmd = _s_clean.strip().lstrip("./: ").lower()
+    if _s_cmd.startswith("playsound "):
+        return False
+
+    # 【过滤】title/subtitle/actionbar 的 times/clear/reset 子命令，以及空文本
+    # 注意：blockdata 不在这里过滤，它里面的 Text1~4 可能有告示牌显示文本
+    if re.match(r'^/?\s*(?:title|subtitle|actionbar)\s', s, re.IGNORECASE):
+        if re.match(r'^/?\s*(?:title|subtitle|actionbar)\s+\S+\s+(?:times|clear|reset)\b', s, re.IGNORECASE):
+            return False
+        _loose = re.findall(r'text\s*:\s*\\?"([^"\\]*)\\?"', s)
+        if _loose and not any(v.strip() for v in _loose):
+            return False
+        _m = re.match(r'^/?\s*(?:title|subtitle|actionbar)\s+\S+\s+(?:title|subtitle|actionbar)\s+"([^"]*)"', s, re.IGNORECASE)
+        if _m and not _m.group(1).strip():
+            return False
+
+    # 【过滤】tellraw 的空 text（有 text: 字段但全为空）
+    if re.match(r'^/?\s*tellraw\s', s, re.IGNORECASE):
+        _loose = re.findall(r'text\s*:\s*\\?"([^"\\]*)\\?"', s)
+        if _loose and not any(v.strip() for v in _loose):
+            return False
+
     if is_output_command(s): return True
-    if is_logic_command(s): return contains_text_component(s)
+    if is_logic_command(s): return _has_translatable_cmd_text(s)
     if is_translation_key(s): return False
     return json_component_has_text(s)
 
 def should_extract_light(path_str, value):
     s = value.strip()
     if not s: return False
+    # 【过滤】坐标字符串：x=...,y=...,z=... 或 [x=...,...]
+    if re.match(r'^\[?[xyz]=', s):
+        return False
+    # 【过滤】playsound 是纯音效指令，没有可翻译文本。
+    # 去掉开头 ./: 后判断，同时覆盖 /playsound 和 ./playsound 两种写法。
+    _s_clean = re.sub(r'[\ue000-\uf8ff\u0000-\u001f]', '', s)
+    _s_cmd = _s_clean.strip().lstrip("./: ").lower()
+    if _s_cmd.startswith("playsound "):
+        return False
     key = last_key(path_str)
-    if key in ("Lore", "lore", "__LORE_MERGE__"): return has_translatable_text(s)
-    if key == "text" and ("Lore" in path_str or "lore" in path_str): return has_translatable_text(s)
-    if key in MERGE_KEYS: return has_translatable_text(s)
+    if key in ("Lore", "lore", "__LORE_MERGE__"): return has_translatable_text(s) and not _is_url_text(s)
+    if key == "text" and ("Lore" in path_str or "lore" in path_str): return has_translatable_text(s) and not _is_url_text(s)
+    if key in MERGE_KEYS: return has_translatable_text(s) and not _is_url_text(s)
     if not has_translatable_text(s) or is_namespace_id(s) or s.lower() in MC_RESERVED_WORDS: return False
+    if _is_url_text(s): return False
     if UUID_RE.match(s) or INTERNAL_TAG_RE.match(s): return False
+    # 【过滤】light 模式也过滤纯逻辑指令，避免 /playsound 等进入实体提取
+    if is_logic_command(s):
+        return _has_translatable_cmd_text(s)
     return True
 
 def should_extract_dp(value):
@@ -1602,8 +1958,9 @@ class ApiProfileManagerDialog(ctk.CTkToplevel):
 class LightThemeApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        # 清理上次崩溃残留的 .tmp 文件
-        for _sub in ("", "region", "entities", "datapacks"):
+        # 确保工作目录存在，并清理上次崩溃残留的 .tmp 文件
+        WORK_DIR.mkdir(exist_ok=True)
+        for _sub in ("", "region", "entities", "datapacks", "LeafLingo_work"):
             _d = BASE_DIR / _sub if _sub else BASE_DIR
             if not _d.is_dir(): continue
             for _tmp in _d.rglob("*.tmp"):
@@ -1644,8 +2001,8 @@ class LightThemeApp(ctk.CTk):
         self.nav_btn_ai.pack(pady=5, padx=15, fill="x")
         
         self.ai_menu_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        ctk.CTkButton(self.ai_menu_frame, text="API 翻译 lang.json", command=lambda: self.open_api_dialog("lang.json"), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
-        ctk.CTkButton(self.ai_menu_frame, text="API 翻译 dp_lang.json", command=lambda: self.open_api_dialog("dp_lang.json"), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
+        ctk.CTkButton(self.ai_menu_frame, text="API 翻译 lang.json", command=lambda: self.open_api_dialog(str(LANG_JSON)), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
+        ctk.CTkButton(self.ai_menu_frame, text="API 翻译 dp_lang.json", command=lambda: self.open_api_dialog(str(DP_LANG_JSON)), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
         ctk.CTkButton(self.ai_menu_frame, text="应用 AI 翻译结果", command=self.open_code_runner, **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
 
         # 翻译查漏 (折叠菜单)
@@ -1654,8 +2011,8 @@ class LightThemeApp(ctk.CTk):
         self.nav_btn_check.pack(pady=5, padx=15, fill="x")
         
         self.check_menu_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        ctk.CTkButton(self.check_menu_frame, text="查漏 lang.json", command=lambda: self.check_missing("lang.json"), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
-        ctk.CTkButton(self.check_menu_frame, text="查漏 dp_lang.json", command=lambda: self.check_missing("dp_lang.json"), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
+        ctk.CTkButton(self.check_menu_frame, text="查漏 lang.json", command=lambda: self.check_missing(str(LANG_JSON)), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
+        ctk.CTkButton(self.check_menu_frame, text="查漏 dp_lang.json", command=lambda: self.check_missing(str(DP_LANG_JSON)), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
 
         # 手动翻译 (折叠菜单)
         self.is_manual_expanded = False
@@ -1663,11 +2020,14 @@ class LightThemeApp(ctk.CTk):
         self.nav_btn_manual.pack(pady=5, padx=15, fill="x")
         
         self.manual_menu_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        ctk.CTkButton(self.manual_menu_frame, text="翻译 lang.json", command=lambda: self.open_manual_translator("lang.json"), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
-        ctk.CTkButton(self.manual_menu_frame, text="翻译 dp_lang.json", command=lambda: self.open_manual_translator("dp_lang.json"), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
+        ctk.CTkButton(self.manual_menu_frame, text="翻译 lang.json", command=lambda: self.open_manual_translator(str(LANG_JSON)), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
+        ctk.CTkButton(self.manual_menu_frame, text="翻译 dp_lang.json", command=lambda: self.open_manual_translator(str(DP_LANG_JSON)), **sub_btn_kwargs).pack(pady=2, padx=(30, 15), fill="x")
 
         self.btn_tutorial = ctk.CTkButton(self.sidebar, text="📖 使用教程", command=self.open_tutorial, fg_color="#E4E7ED", text_color="#333333", hover_color="#D0D0D0", font=("Microsoft YaHei", 14, "bold"))
-        self.btn_tutorial.pack(side="bottom", pady=20, padx=15, fill="x")
+        self.btn_tutorial.pack(side="bottom", pady=(0, 20), padx=15, fill="x")
+
+        self.btn_clean_work = ctk.CTkButton(self.sidebar, text="🧹 清理工作目录", command=self.clean_work_dir, fg_color="#E4E7ED", text_color="#333333", hover_color="#D0D0D0", font=("Microsoft YaHei", 14, "bold"))
+        self.btn_clean_work.pack(side="bottom", pady=(5, 0), padx=15, fill="x")
 
         # 右侧主区域
         self.main_frame = ctk.CTkFrame(self, fg_color="#FFFFFF", corner_radius=0)
@@ -1804,7 +2164,7 @@ class LightThemeApp(ctk.CTk):
             seen = {}
             for t in texts:
                 # 【修复】拦截以 eyJ 开头的 Base64 乱码（头颅皮肤数据），直接跳过
-                if t.startswith("eyJ"): continue
+                if _is_base64_blob(t): continue
                 if t not in seen: seen[t] = sha256(t.encode("utf-8")).hexdigest()
             result = [{"SHA256": h, "TEXT": t} for t, h in seen.items()]
             _atomic_save_json(LANG_JSON, result)
@@ -2076,7 +2436,7 @@ class LightThemeApp(ctk.CTk):
             seen = {}
             for t in texts:
                 # 【修复】同样拦截 Base64 乱码
-                if t.startswith("eyJ"): continue
+                if _is_base64_blob(t): continue
                 if t not in seen: seen[t] = sha256(t.encode("utf-8")).hexdigest()
             result = [{"SHA256": h, "TEXT": t} for t, h in seen.items()]
             _atomic_save_json(DP_LANG_JSON, result)
@@ -2206,7 +2566,7 @@ class LightThemeApp(ctk.CTk):
     def open_api_dialog(self, target_file):
         if not os.path.exists(target_file): return self.log_msg(f"❌ 找不到 {target_file}")
         win = ctk.CTkToplevel(self)
-        win.title(f"🚀 API 翻译 - {target_file}")
+        win.title(f"🚀 API 翻译 - {Path(target_file).name}")
         _w, _h = _fit_size(win, 500, 600)
         win.geometry(f"{_w}x{_h}")
         win.attributes("-topmost", True)
@@ -2220,7 +2580,7 @@ class LightThemeApp(ctk.CTk):
         header.pack(fill="x")
         header.pack_propagate(False)
         ctk.CTkLabel(header, text="🚀 API 自动翻译", font=("Microsoft YaHei", 18, "bold"), text_color="#333333").pack(side="left", padx=20)
-        ctk.CTkLabel(header, text=target_file, font=("Microsoft YaHei", 12), text_color="#777777").pack(side="left")
+        ctk.CTkLabel(header, text=Path(target_file).name, font=("Microsoft YaHei", 12), text_color="#777777").pack(side="left")
 
         btn_frame = ctk.CTkFrame(win, fg_color="#F0F2F5", height=70)
         btn_frame.pack(fill="x", side="bottom")
@@ -2547,7 +2907,7 @@ class LightThemeApp(ctk.CTk):
                 raw_text = "".join(c for c in raw_text if c.isprintable() or c in "\n\t")
                 stripped = raw_text.strip()
                 if not stripped: continue
-                if stripped.startswith("eyJ"): continue
+                if _is_base64_blob(stripped): continue
                 if stripped.startswith("{") or stripped.startswith("["):
                     try:
                         obj = json.loads(stripped)
@@ -2556,9 +2916,11 @@ class LightThemeApp(ctk.CTk):
                 else:
                     if stripped.startswith("minecraft:"): continue
                     if not re.search(r"[a-zA-Z\u4e00-\u9fff]", stripped): continue
+                    if _is_playsound_text(stripped): continue
+                    if _is_url_text(stripped): continue
                 display_text = extract_display_text(raw_text)
                 if not display_text or not display_text.strip(): continue
-                if display_text.strip().startswith("eyJ"): continue
+                if _is_base64_blob(display_text): continue
                 all_targets.append((i, display_text))
 
             if scope == "仅未翻译":
@@ -2768,8 +3130,8 @@ class LightThemeApp(ctk.CTk):
                 return self.log_msg("⚠ 输入内容为空（剥离 Markdown 后）")
 
             # 用 BASE_DIR 拼绝对路径，不再依赖启动目录
-            target_file = str(BASE_DIR / target_opt.get())
-            if not os.path.exists(target_file): return self.log_msg(f"❌ 找不到 {target_file}")
+            target_file = str(WORK_DIR / target_opt.get())
+            if not os.path.exists(target_file): return self.log_msg(f"❌ 找不到 {Path(target_file).name}")
 
             code_output.configure(state="normal"); code_output.delete("1.0", "end"); code_output.configure(state="disabled")
             
@@ -2785,7 +3147,7 @@ class LightThemeApp(ctk.CTk):
                 old_argv = sys.argv
                 
                 import runpy
-                temp_script = os.path.join(BASE_DIR, "_ai_patch_temp.py")
+                temp_script = os.path.join(WORK_DIR, "_ai_patch_temp.py")
                 
                 try:
                     # 【核心修复】如果检测到是完整的独立脚本
@@ -2898,15 +3260,15 @@ class LightThemeApp(ctk.CTk):
     # --- 查漏与手动翻译 ---
     def check_missing(self, target_file):
         def task():
-            self.log_msg(f"开始扫描 {target_file} 中未翻译的文本...")
+            self.log_msg(f"开始扫描 {Path(target_file).name} 中未翻译的文本...")
             try:
                 with open(target_file, "r", encoding="utf-8") as f: data = json.load(f)
                 missing = []
                 for item in data:
                     sha = item.get("SHA256", ""); raw_text = item.get("TEXT", "")
-                    if raw_text.strip().startswith("eyJ"): continue
+                    if _is_base64_blob(raw_text): continue
                     display = extract_for_check(raw_text)
-                    if display and not display.startswith("eyJ"):
+                    if display and not _is_base64_blob(display):
                         missing.append((sha, display))
                 self.after(0, lambda: self._show_missing_window(target_file, missing))
             except Exception as e: self.log_msg(f"✗ 查漏出错: {e}")
@@ -2917,7 +3279,7 @@ class LightThemeApp(ctk.CTk):
         self.log_msg(f"✓ 查漏完毕！共找到 {len(missing)} 条。")
 
         win = ctk.CTkToplevel(self)
-        win.title(f"🔍 查漏结果 - {target_file}")
+        win.title(f"🔍 查漏结果 - {Path(target_file).name}")
         _w, _h = _fit_size(win, 820, 640)
         win.geometry(f"{_w}x{_h}")
         win.attributes("-topmost", True)
@@ -2931,7 +3293,7 @@ class LightThemeApp(ctk.CTk):
         header.pack(fill="x")
         header.pack_propagate(False)
         ctk.CTkLabel(header, text="🔍 翻译查漏结果", font=("Microsoft YaHei", 18, "bold"), text_color="#333333").pack(side="left", padx=20)
-        ctk.CTkLabel(header, text=f"{target_file} · 共 {len(missing)} 条未翻译", font=("Microsoft YaHei", 12), text_color="#777777").pack(side="left")
+        ctk.CTkLabel(header, text=f"{Path(target_file).name} · 共 {len(missing)} 条未翻译", font=("Microsoft YaHei", 12), text_color="#777777").pack(side="left")
 
         bottom_bar = ctk.CTkFrame(win, fg_color="#F0F2F5", height=70)
         bottom_bar.pack(fill="x", side="bottom")
@@ -3006,7 +3368,7 @@ class LightThemeApp(ctk.CTk):
             raw_text = "".join(c for c in raw_text if c.isprintable() or c in "\n\t")
             stripped = raw_text.strip()
             if not stripped: continue
-            if stripped.startswith("eyJ"): continue
+            if _is_base64_blob(stripped): continue
 
             # 【严格过滤】无可翻文本的条目直接跳过
             if stripped.startswith("{") or stripped.startswith("["):
@@ -3021,15 +3383,19 @@ class LightThemeApp(ctk.CTk):
                     continue       # 纯 minecraft: 命令跳过
                 if not re.search(r'[a-zA-Z\u4e00-\u9fff]', stripped):
                     continue       # 无字母无中文 → 跳过
+                if _is_playsound_text(stripped):
+                    continue       # 纯 /playsound 音效指令，跳过
+                if _is_url_text(stripped):
+                    continue       # 纯 URL / 域名，跳过
 
             display_text = extract_display_text(raw_text)
             if not display_text or not display_text.strip(): continue
-            if display_text.strip().startswith("eyJ"): continue
+            if _is_base64_blob(display_text): continue
             to_translate.append((i, display_text))
 
         if not to_translate: return self.log_msg(f"✓ {target_file} 中没有需要翻译的纯英文条目。")
         window = ctk.CTkToplevel(self)
-        window.title(f"📝 手动翻译 - {target_file}")
+        window.title(f"📝 手动翻译 - {Path(target_file).name}")
         _w, _h = _fit_size(window, 900, 800)
         window.geometry(f"{_w}x{_h}")
         window.attributes("-topmost", True)
@@ -3262,8 +3628,143 @@ class LightThemeApp(ctk.CTk):
         bottom_bar = ctk.CTkFrame(window, fg_color="#F0F2F5", height=70)
         bottom_bar.pack(fill="x", side="bottom")
         bottom_bar.pack_propagate(False)
+
+        def export_extracted():
+            from tkinter import filedialog
+            path = filedialog.asksaveasfilename(
+                title="导出手动翻译提取列表",
+                defaultextension=".txt",
+                filetypes=[("文本文件", "*.txt"), ("JSON 文件", "*.json")],
+                initialfile=f"manual_extracted_{len(to_translate)}条.txt",
+                parent=window,
+            )
+            if not path:
+                return
+            try:
+                if path.lower().endswith(".txt"):
+                    lines = []
+                    for idx, display in to_translate:
+                        fp = _text_fp(data[idx].get("TEXT", ""))
+                        one = display.replace("\n", "\\n")
+                        lines.append(f"[{fp}] {one}")
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
+                else:
+                    out = []
+                    for idx, display in to_translate:
+                        out.append({
+                            "idx": idx,
+                            "TEXT": data[idx].get("TEXT", ""),
+                            "display": display,
+                        })
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(out, f, ensure_ascii=False, indent=2)
+                self.log_msg(f"✓ 已导出 {len(to_translate)} 条提取列表到 {path}")
+            except Exception as e:
+                self.log_msg(f"❌ 导出失败: {e}")
+
+        def import_txt():
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(
+                title="选择译文 TXT（每行一条，按提取顺序对应）",
+                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+                parent=window,
+            )
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lines = f.read().splitlines()
+            except Exception as e:
+                self.log_msg(f"❌ 读取 TXT 失败: {e}")
+                return
+            if not lines:
+                self.log_msg("⚠ TXT 为空")
+                return
+            save_current_page_inputs()
+            # 建立 fp -> idx 映射，只针对当前 to_translate
+            fp2idx = {}
+            fp_collision = 0
+            for idx, _display in to_translate:
+                fp = _text_fp(data[idx].get("TEXT", ""))
+                if fp in fp2idx:
+                    fp_collision += 1
+                fp2idx[fp] = idx
+            filled = 0
+            skipped_empty = 0
+            skipped_bad = 0
+            skipped_unknown = 0
+            for line in lines:
+                if not line.strip():
+                    skipped_empty += 1
+                    continue
+                m = re.match(r'^\s*\[([0-9a-fA-F]{8})\]\s?(.*)$', line)
+                if not m:
+                    skipped_bad += 1
+                    continue
+                fp = m.group(1).lower()
+                if fp not in fp2idx:
+                    skipped_unknown += 1
+                    continue
+                val = m.group(2).replace("\\n", "\n")
+                if not val.strip():
+                    skipped_empty += 1
+                    continue
+                idx = fp2idx[fp]
+                translated_dict[idx] = replace_display_text(data[idx]["TEXT"], val)
+                filled += 1
+            current_page[0] = 0
+            refresh_filtered()
+            render_page()
+            canvas.yview_moveto(0)
+            msg = (
+                f"✓ 已导入 {filled} 条译文"
+                f"（空行 {skipped_empty}，无 [fp] 前缀 {skipped_bad}，fp 不在当前列表 {skipped_unknown}）"
+            )
+            if fp_collision:
+                msg += f" ⚠ 有 {fp_collision} 条文本内容重复，只保留最后一条"
+            self.log_msg(msg)
+
+        ctk.CTkButton(bottom_bar, text="📥 导入译文 TXT", fg_color="#E4E7ED", hover_color="#D0D0D0",
+                      text_color="#333333", font=("Microsoft YaHei", 14, "bold"), height=40, width=160,
+                      command=import_txt).pack(side="left", padx=(20, 5), pady=15)
+        ctk.CTkButton(bottom_bar, text="📤 导出提取列表", fg_color="#E4E7ED", hover_color="#D0D0D0",
+                      text_color="#333333", font=("Microsoft YaHei", 14, "bold"), height=40, width=160,
+                      command=export_extracted).pack(side="left", padx=5, pady=15)
         ctk.CTkButton(bottom_bar, text="💾 保存并替换所有页", fg_color="#007ACC", hover_color="#005A9E",
-                      font=("Microsoft YaHei", 14, "bold"), height=40, command=save_all_translations).pack(fill="x", padx=20, pady=15)
+                      font=("Microsoft YaHei", 14, "bold"), height=40,
+                      command=save_all_translations).pack(side="left", fill="x", expand=True, padx=(5, 20), pady=15)
+
+    # ==========================================
+    # 工作目录清理
+    # ==========================================
+    def clean_work_dir(self):
+        """侧边栏按钮：删除整个 LeafLingo_work/ 目录。"""
+        if not WORK_DIR.exists():
+            messagebox.showinfo("提示", f"工作目录 {WORK_DIR.name} 不存在，无需清理。")
+            return
+        msg = (
+            f"将删除整个工作目录 {WORK_DIR.name}/，包含：\n\n"
+            f"  data.json        （提取的原文）\n"
+            f"  data_orig.json   （原始备份）\n"
+            f"  lang.json        （译文）\n"
+            f"  dp_data.json     （数据包原文）\n"
+            f"  dp_lang.json     （数据包译文）\n"
+            f"  config.json      （API 配置）\n"
+            f"  datapacks_backup/（数据包备份）\n\n"
+            f"注意：\n"
+            f"  · 删除后需要重新【1】→【2】才能再翻译\n"
+            f"  · 存档 region/entities/datapacks 本身不会被删除\n"
+            f"  · 整存档备份 {WORLD_BACKUP.name} 不会被删除\n\n"
+            f"确定删除整个 {WORK_DIR.name}/ 目录吗？"
+        )
+        if not messagebox.askyesno("确认删除工作目录", msg):
+            return
+        try:
+            shutil.rmtree(WORK_DIR)
+            self.log_msg(f"✓ 工作目录 {WORK_DIR.name}/ 已整体删除")
+        except Exception as e:
+            self.log_msg(f"❌ 删除失败: {e}")
 
     # ==========================================
     # 使用教程
