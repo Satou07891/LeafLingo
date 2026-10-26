@@ -608,10 +608,10 @@ def _replace_all_texts(raw_text, new_lines):
 
 def _unwrap_cmd(raw_text):
     """如果指令被包在 JSON 组件里，剥离外壳返回真实的指令字符串"""
-    raw_text = raw_text.strip()
-    if raw_text.startswith("{") and raw_text.endswith("}"):
+    stripped = raw_text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
         try:
-            obj = json.loads(raw_text)
+            obj = json.loads(stripped)
             if isinstance(obj, dict) and isinstance(obj.get("text"), str):
                 inner = obj["text"]
                 if re.match(r'^/?\s*(?:give|execute|summon|setblock|fill|data|scoreboard|tp|teleport|function|advancement|item|effect|enchant|say|tellraw|title|subtitle|actionbar|me|msg|tell|kill|clear|xp|experience|gamerule|time|weather|spawnpoint|setworldspawn|playsound|particle)\s', inner, re.IGNORECASE):
@@ -1227,13 +1227,35 @@ def extract_mca_entities(chunk_root, mode):
                 try:
                     obj = json.loads(v)
                     if isinstance(obj, dict):
-                        fmt = {}
-                        if isinstance(obj.get("color"), str): fmt["color"] = obj["color"]
-                        if obj.get("bold"): fmt["bold"] = True
-                        if obj.get("italic"): fmt["italic"] = True
-                        lore_formats.setdefault(parent, {})[idx] = fmt  # 👈 注意这里，改成用字典存
+                        fmt = dict(obj) # 保留所有字段：color, clickEvent, hoverEvent, underlined 等
+                        fmt.pop("text", None) # 文本在合并时由译文重新填入
+                        lore_formats.setdefault(parent, {})[idx] = fmt
                 except Exception:
                     pass
+
+            # 【双重记录】书本的原始值（用于写回时保留 JSON 结构，如 clickEvent）
+            pages_orig = {}
+            for k, v in list(strings.items()):
+                m_pg = re.match(r"^(?:(.*)\.)?pages\[(\d+)\]$", k)
+                if not m_pg: continue
+                _p = (m_pg.group(1) or "").rstrip(".")
+                try:
+                    _i = int(m_pg.group(2))
+                except ValueError:
+                    continue
+                pages_orig.setdefault(_p, {})[_i] = v
+
+            # 【双重记录】告示牌的原始值（用于写回时保留 JSON 结构，如 clickEvent）
+            sign_orig = {}
+            for k, v in list(strings.items()):
+                m_sign = re.match(r"^(?:(.*)\.)?Text([1-4])$", k)
+                if not m_sign: continue
+                _p = (m_sign.group(1) or "").rstrip(".")
+                try:
+                    _i = int(m_sign.group(2)) - 1
+                except ValueError:
+                    continue
+                sign_orig.setdefault(_p, {})[_i] = v
 
             _merge_group(strings, re.compile(r"^(?:(.*)\.)?Text([1-4])$"), MERGE_SIGN_T1)
             _merge_group(strings, re.compile(r"^(?:(.*)\.)?messages\[(\d+)\]$"), MERGE_SIGN_MSG)
@@ -1274,6 +1296,30 @@ def extract_mca_entities(chunk_root, mode):
                 entry["LORE_ORIG"] = lore_orig_dict
             if formats_dict:
                 entry["FORMATS"] = formats_dict
+
+            # 【新增】书本原始结构
+            if pages_orig:
+                _pg_dict = {}
+                for _p, _idx_map in pages_orig.items():
+                    _max_i = max(_idx_map.keys())
+                    _raw_list = [_idx_map.get(_i, "") for _i in range(_max_i + 1)]
+                    _merge_key = f"{_p}.{MERGE_BOOK}" if _p else MERGE_BOOK
+                    if _merge_key in filtered:
+                        _pg_dict[_merge_key] = _raw_list
+                if _pg_dict:
+                    entry["PAGES_ORIG"] = _pg_dict
+
+            # 【新增】告示牌原始结构（用于写回时保留 JSON 组件字段）
+            if sign_orig:
+                _sign_dict = {}
+                for _p, _idx_map in sign_orig.items():
+                    _max_i = max(_idx_map.keys())
+                    _raw_list = [_idx_map.get(_i, "") for _i in range(_max_i + 1)]
+                    _merge_key = f"{_p}.{MERGE_SIGN_T1}" if _p else MERGE_SIGN_T1
+                    if _merge_key in filtered:
+                        _sign_dict[_merge_key] = _raw_list
+                if _sign_dict:
+                    entry["SIGN_ORIG"] = _sign_dict
 
             # 【新增】messages 原始结构（用于写回时保留 JSON 组件字段）
             if msg_orig:
@@ -1544,10 +1590,30 @@ def _do_repack(original_zip, extract_dir):
 def smart_wrap_sign_text(text, max_lines=4, max_width=15):
     if not text: return []
     def width(s): return sum(2 if ord(c) > 127 else 1 for c in s)
+    
+    # 1. 按换行拆分
     if "\n" in text:
         lines = text.split("\n")
-        while lines and not lines[-1].strip(): lines.pop()
-        return lines[:max_lines]
+    else:
+        lines = [text]
+        
+    # 2. 去掉首尾纯空白行（原版留下的占位空行）
+    while lines and not lines[0].strip(): lines.pop(0)
+    while lines and not lines[-1].strip(): lines.pop()
+    
+    # 3. 纯空文本直接返回
+    if not lines:
+        return [""]
+        
+    # 4. 如果用户没有写满 4 行，自动补空行实现垂直居中
+    if len(lines) == 1:
+        lines = ["", lines[0], "", ""]
+    elif len(lines) == 2:
+        lines = ["", lines[0], lines[1], ""]
+    elif len(lines) == 3:
+        lines = ["", lines[0], lines[1], lines[2]]
+        
+    return lines[:max_lines]
     parts = re.split(r'([，。！？,.!?；;：:])', text)
     chunks = [parts[i] + parts[i+1] for i in range(0, len(parts)-1, 2)] + ([parts[-1]] if len(parts)%2!=0 and parts[-1] else [])
     lines, current = [], ""
@@ -2195,8 +2261,12 @@ class LightThemeApp(ctk.CTk):
                                 new_v = map_text(v)
                                 if p.endswith(MERGE_SIGN_T1):
                                     parent = p[:-len(MERGE_SIGN_T1)].rstrip(".")
+                                    orig_signs = e.get("SIGN_ORIG", {}).get(p, [])
                                     lines = smart_wrap_sign_text(new_v)
-                                    for i in range(4): new_path[f"{parent}.Text{i+1}" if parent else f"Text{i+1}"] = lines[i] if i < len(lines) else ""
+                                    for i in range(4):
+                                        _line = lines[i] if i < len(lines) else ""
+                                        _raw = orig_signs[i] if i < len(orig_signs) else ""
+                                        new_path[f"{parent}.Text{i+1}" if parent else f"Text{i+1}"] = _rebuild_msg_component(_line, _raw)
                                 elif p.endswith(MERGE_SIGN_MSG):
                                     parent = p[:-len(MERGE_SIGN_MSG)].rstrip(".")
                                     orig_msgs = e.get("MSG_ORIG", {}).get(p, [])
@@ -2207,7 +2277,10 @@ class LightThemeApp(ctk.CTk):
                                         new_path[f"{parent}.messages[{i}]" if parent else f"messages[{i}]"] = _rebuild_msg_component(_line, _raw)
                                 elif p.endswith(MERGE_BOOK):
                                     parent = p[:-len(MERGE_BOOK)].rstrip(".")
-                                    for i, page in enumerate(new_v.split("\n===PAGE_BREAK===\n")): new_path[f"{parent}.pages[{i}]" if parent else f"pages[{i}]"] = _make_comp(page)
+                                    orig_pages = e.get("PAGES_ORIG", {}).get(p, [])
+                                    for i, page in enumerate(new_v.split("\n===PAGE_BREAK===\n")):
+                                        _raw = orig_pages[i] if i < len(orig_pages) else ""
+                                        new_path[f"{parent}.pages[{i}]" if parent else f"pages[{i}]"] = _rebuild_msg_component(page, _raw)
                                 elif p.endswith(MERGE_LORE):
                                     parent = p[:-len(MERGE_LORE)].rstrip(".")
                                     orig_lines = e.get("LORE_ORIG", {}).get(p, [])
@@ -2245,9 +2318,11 @@ class LightThemeApp(ctk.CTk):
                                             comp, ensure_ascii=False, separators=(",", ":")
                                         )
                                 else:
-                                    # 如果是 JSON 字符串，统一压紧格式去掉空格
+                                    # 如果原文是 JSON 组件，且新文本变成纯文本，尝试保留原结构
                                     final_v = new_v
-                                    if isinstance(new_v, str) and (new_v.startswith("{") or new_v.startswith("[")):
+                                    if isinstance(v, str) and v.strip().startswith("{"):
+                                        final_v = _rebuild_msg_component(new_v, v)
+                                    elif isinstance(new_v, str) and (new_v.startswith("{") or new_v.startswith("[")):
                                         try:
                                             parsed = json.loads(new_v)
                                             final_v = json.dumps(parsed, ensure_ascii=False, separators=(',', ':'))
@@ -3694,6 +3769,7 @@ class LightThemeApp(ctk.CTk):
             skipped_empty = 0
             skipped_bad = 0
             skipped_unknown = 0
+            unchanged = []
             for line in lines:
                 if not line.strip():
                     skipped_empty += 1
@@ -3711,7 +3787,21 @@ class LightThemeApp(ctk.CTk):
                     skipped_empty += 1
                     continue
                 idx = fp2idx[fp]
-                translated_dict[idx] = replace_display_text(data[idx]["TEXT"], val)
+                raw = data[idx]["TEXT"]
+                new_text = replace_display_text(raw, val)
+                if new_text == raw and val.strip() and not (raw.strip().startswith("{") or raw.strip().startswith("[")):
+                    # 纯文本条目 replace_display_text 没生效，直接覆盖，保留首尾空白
+                    leading_ws = re.match(r'^\s*', raw).group(0) if raw else ""
+                    trailing_ws = re.search(r'\s*$', raw).group(0) if raw else ""
+                    final = val.strip()
+                    if not re.match(r'^\s', val):
+                        final = leading_ws + final
+                    if not re.search(r'\s$', val):
+                        final = final + trailing_ws
+                    new_text = final
+                if new_text == raw:
+                    unchanged.append((idx, raw, val))
+                translated_dict[idx] = new_text
                 filled += 1
             current_page[0] = 0
             refresh_filtered()
