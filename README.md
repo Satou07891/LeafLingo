@@ -132,7 +132,7 @@ nbtlib — NBT 解析
 
 CustomTkinter — UI
 
-maptranslate — 灵感来自
+本项目灵感来自 [maptranslate](https://github.com/xmdhs/maptranslate)。
 
 ⚠️ 本工具不保证 100% 覆盖所有文本，过滤规则可能会误筛少量边角内容，但主体展示文本（告示牌、书本、物品、实体名、标题）覆盖率在 97% 以上。如遇明显漏翻，欢迎提交 Issue 并附上TEXT原文
 <img width="1901" height="1024" alt="image" src="https://github.com/user-attachments/assets/8f3cb2e2-848a-40d4-8c48-4f21227a4037" />
